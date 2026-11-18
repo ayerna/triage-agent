@@ -7,5 +7,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Make the startup script executable
+RUN chmod +x scripts/start.sh
+
+# Render sets $PORT dynamically; start.sh normalises DATABASE_URL,
+# runs Alembic migrations, seeds, then starts uvicorn.
+CMD ["bash", "scripts/start.sh"]

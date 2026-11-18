@@ -1,10 +1,12 @@
 """
 FastAPI application entry point.
-Mounts all routers. CORS is open in dev (tighten for production).
+Mounts all routers. CORS origins are read from ALLOWED_ORIGINS env var
+so the production Render URL can be added without code changes.
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.config import settings
 from app.routers import auth, incidents
 
 app = FastAPI(
@@ -15,12 +17,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://localhost:8000",
-    ],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

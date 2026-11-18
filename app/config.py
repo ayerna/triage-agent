@@ -21,5 +21,12 @@ class Settings(BaseSettings):
     GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"
     GROQ_MODEL: str = "openai/gpt-oss-20b"
 
+    # CORS — comma-separated list of allowed origins; override in production
+    ALLOWED_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://localhost:8000"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
 
 settings = Settings()
