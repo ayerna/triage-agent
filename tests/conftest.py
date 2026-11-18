@@ -25,8 +25,8 @@ from app.main import app
 from app.models import User
 
 ASYNC_DB_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+asyncpg://triage_user:triage_pass@localhost:5432/triage_db",
+    "TEST_DATABASE_URL",
+    "postgresql+asyncpg://triage_user:triage_pass@localhost:5432/triage_test_db",
 )
 SYNC_DB_URL = ASYNC_DB_URL.replace("postgresql+asyncpg://", "postgresql://")
 
