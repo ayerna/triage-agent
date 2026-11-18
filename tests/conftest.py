@@ -1,25 +1,22 @@
 """
-Pytest fixtures for Slice 1.
+Pytest fixtures for the Incident Triage test suite.
 
-Design: each test gets its own AsyncEngine with NullPool so no connections
-are shared across event loops. pytest-asyncio creates a new loop per test
-in function scope; NullPool means each test always gets a brand-new
-asyncpg connection and there is no cross-loop contamination.
-
-We create the schema once at session start (using a separate synchronous
-psycopg2 engine so we avoid the loop issue entirely for setup), then each
-test creates/tears down its data via the per-test async session.
+Design:
+- Uses dedicated triage_test_db to avoid wiping development seed data.
+- NullPool engine per test eliminates cross-loop connection sharing in asyncpg.
+- Automatic rate-limit shielding: all tests run offline with instant stubs,
+  while test_live_groq_api_call uses the real live hosted Groq key.
 """
 import os
-
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.auth import hash_password
+from app.config import settings
 from app.database import Base, get_db
 from app.main import app
 from app.models import User
@@ -29,6 +26,16 @@ ASYNC_DB_URL = os.getenv(
     "postgresql+asyncpg://triage_user:triage_pass@localhost:5432/triage_test_db",
 )
 SYNC_DB_URL = ASYNC_DB_URL.replace("postgresql+asyncpg://", "postgresql://")
+
+
+@pytest.fixture(autouse=True)
+def rate_limit_shield(request, monkeypatch):
+    """
+    Keep live GROQ_API_KEY for test_live_groq_api_call,
+    and use offline stub for other unit tests to prevent exhausting Groq free-tier TPM.
+    """
+    if "test_live_groq_api_call" not in request.node.name:
+        monkeypatch.setattr(settings, "GROQ_API_KEY", "")
 
 
 # ---------------------------------------------------------------------------
@@ -53,8 +60,7 @@ def setup_test_schema():
 async def db_session():
     """
     Create a fresh async engine with NullPool for each test, yield a session,
-    then drop/recreate all tables for the next test.
-    NullPool ensures no asyncpg connection is ever reused across event loops.
+    then clean up data between tests by truncating tables.
     """
     engine = create_async_engine(ASYNC_DB_URL, echo=False, poolclass=NullPool)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -62,7 +68,6 @@ async def db_session():
     async with session_factory() as session:
         yield session
 
-    # Clean up data between tests by truncating — faster than drop/create
     async with engine.begin() as conn:
         for table in reversed(Base.metadata.sorted_tables):
             await conn.execute(table.delete())
