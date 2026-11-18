@@ -3,7 +3,9 @@ Agent tools reading from PostgreSQL.
 Per spec:
 1. search_past_incidents: text search over past incidents, returns id + title + severity + status
 2. get_incident: reads details of a specific past incident match
+3. TOOL_DEFINITIONS: OpenAI / Groq compatible function schemas for tool calling
 """
+from typing import Any
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,3 +67,47 @@ async def get_incident(db: AsyncSession, incident_id: int) -> dict | None:
         "category": inc.category,
         "created_at": inc.created_at.isoformat() if inc.created_at else None,
     }
+
+
+# ── OpenAI / Groq Tool Definitions for Function Calling ───────────────────────
+
+TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_past_incidents",
+            "description": "Search past incidents in PostgreSQL by keywords in title or description.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords to search in past incidents (e.g. 'cooling pump leak', 'radar failure')",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of incidents to return (default 3)",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_incident",
+            "description": "Fetch detailed information of a specific incident by its integer ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "incident_id": {
+                        "type": "integer",
+                        "description": "The integer ID of the past incident to inspect",
+                    },
+                },
+                "required": ["incident_id"],
+            },
+        },
+    },
+]

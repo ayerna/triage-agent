@@ -5,6 +5,7 @@ Follows spec:
 - Single calls, one at a time, no parallel calls.
 - Concise prompts strictly staying under 8,000 tokens/min cap.
 - Extracts JSON cleanly (strips markdown fencing if present).
+- Sends tool definitions in Groq payload for real function calling.
 """
 import json
 import re
@@ -12,6 +13,7 @@ from typing import Any
 import httpx
 
 from app.agent.schemas import CriticResult, TriageProposal
+from app.agent.tools import TOOL_DEFINITIONS
 from app.config import settings
 
 
@@ -24,8 +26,13 @@ def clean_json_text(text: str) -> str:
     return text
 
 
-async def call_groq_chat(messages: list[dict[str, str]], max_tokens: int = 350) -> str:
-    """Execute one asynchronous chat completion call against Groq."""
+async def call_groq_completion(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict | None = None,
+    max_tokens: int = 350,
+) -> dict[str, Any]:
+    """Execute chat completion returning full response choice message (content, tool_calls, etc)."""
     if not settings.GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY is not configured in .env")
 
@@ -33,12 +40,16 @@ async def call_groq_chat(messages: list[dict[str, str]], max_tokens: int = 350) 
         "Authorization": f"Bearer {settings.GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {
+    payload: dict[str, Any] = {
         "model": settings.GROQ_MODEL,
         "messages": messages,
         "temperature": 0.1,
         "max_tokens": max_tokens,
     }
+    if tools:
+        payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
@@ -51,8 +62,64 @@ async def call_groq_chat(messages: list[dict[str, str]], max_tokens: int = 350) 
                 f"Groq API returned status {response.status_code}: {response.text}"
             )
         data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        return clean_json_text(content)
+        return data["choices"][0]["message"]
+
+
+async def call_groq_chat(messages: list[dict[str, str]], max_tokens: int = 350) -> str:
+    """Execute one asynchronous chat completion call against Groq and return clean text."""
+    message = await call_groq_completion(messages=messages, max_tokens=max_tokens)
+    return clean_json_text(message.get("content") or "")
+
+
+async def groq_tool_caller(
+    incident: dict,
+    tools: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Invokes Groq with real tool definitions.
+    Returns parsed tool calls requested by the model:
+    [{"id": "...", "name": "...", "arguments": {...}}]
+    """
+    tools = tools or TOOL_DEFINITIONS
+    system_msg = (
+        "You are an investigative triage assistant for maritime vessel equipment incidents. "
+        "Your task is to search past incidents to find relevant precedent before deciding severity. "
+        "Call the appropriate function (e.g. search_past_incidents) to gather evidence."
+    )
+    user_msg = (
+        f"Incident #{incident.get('id')}\n"
+        f"Title: {incident.get('title')}\n"
+        f"Description: {incident.get('description')}\n\n"
+        "Please search past incidents or fetch details if relevant."
+    )
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+
+    message = await call_groq_completion(
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        max_tokens=250,
+    )
+
+    tool_calls = message.get("tool_calls") or []
+    parsed_calls = []
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        fn_name = fn.get("name")
+        raw_args = fn.get("arguments", "{}")
+        try:
+            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except Exception:
+            parsed_args = {}
+        parsed_calls.append({
+            "id": tc.get("id"),
+            "name": fn_name,
+            "arguments": parsed_args,
+        })
+    return parsed_calls
 
 
 async def groq_decider(
