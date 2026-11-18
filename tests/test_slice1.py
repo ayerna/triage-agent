@@ -150,7 +150,7 @@ async def test_triage_404_unknown_incident(client, auth_headers):
 
 
 @pytest.mark.asyncio
-async def test_triage_501_not_implemented(client, auth_headers):
+async def test_triage_now_implemented(client, auth_headers):
     create_resp = await client.post(
         "/incidents",
         json={"title": "Oil Leak", "description": "Lube oil leak on aux engine"},
@@ -158,7 +158,7 @@ async def test_triage_501_not_implemented(client, auth_headers):
     )
     incident_id = create_resp.json()["id"]
     resp = await client.post(f"/incidents/{incident_id}/triage", headers=auth_headers)
-    assert resp.status_code == 501
+    assert resp.status_code == 201
 
 
 @pytest.mark.asyncio

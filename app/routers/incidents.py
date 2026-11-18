@@ -1,19 +1,21 @@
 """
-Incident CRUD endpoints — all protected by JWT.
+Incident CRUD and Agent endpoints — all protected by JWT.
 
-GET  /incidents        — list with latest triage status (JOIN across tables)
-POST /incidents        — create; 400 on blank title/description
-GET  /incidents/{id}   — detail; 404 if missing
-POST /incidents/{id}/triage    — placeholder in Slice 1 (implemented in Slice 2)
-POST /incidents/{id}/decision  — placeholder in Slice 1 (implemented in Slice 2)
+GET  /incidents                — list with latest triage status (JOIN across tables)
+POST /incidents                — create; 400 on blank title/description
+GET  /incidents/{id}           — detail; 404 if missing
+POST /incidents/{id}/triage    — runs agent loop, records TriageRun, updates status
+POST /incidents/{id}/decision  — writes decision & updates status in ONE atomic transaction
 """
+import json
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, outerjoin
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.loop import TriageError, run_triage_loop
 from app.auth import get_current_user
 from app.database import get_db
-from app.models import Decision, Incident, TriageRun, User
+from app.models import Decision, Incident, SeverityEnum, StatusEnum, TriageRun, User
 from app.schemas import (
     DecisionCreate,
     DecisionOut,
@@ -31,12 +33,10 @@ async def list_incidents(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Return all incidents with latest triage_run id (via LEFT JOIN)."""
-    # Subquery: latest triage run per incident
+    """Return all incidents with latest triage_run id."""
     result = await db.execute(select(Incident).order_by(Incident.created_at.desc()))
     incidents = result.scalars().all()
 
-    # For each incident, get the latest triage_run id
     items = []
     for inc in incidents:
         tr_result = await db.execute(
@@ -50,6 +50,7 @@ async def list_incidents(
             IncidentListItem(
                 id=inc.id,
                 title=inc.title,
+                category=inc.category,
                 severity=inc.severity.value if inc.severity else None,
                 status=inc.status.value,
                 created_at=inc.created_at,
@@ -77,6 +78,7 @@ async def create_incident(
         id=incident.id,
         title=incident.title,
         description=incident.description,
+        category=incident.category,
         severity=incident.severity.value if incident.severity else None,
         status=incident.status.value,
         created_by=incident.created_by,
@@ -98,6 +100,7 @@ async def get_incident(
         id=incident.id,
         title=incident.title,
         description=incident.description,
+        category=incident.category,
         severity=incident.severity.value if incident.severity else None,
         status=incident.status.value,
         created_by=incident.created_by,
@@ -111,14 +114,47 @@ async def triage_incident(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Agent loop — implemented in Slice 2. Returns 501 in Slice 1."""
+    """
+    Run the triage agent loop for this incident.
+    Persists TriageRun with proposal, steps, rule checks, critic output.
+    Updates incident status to Triaged.
+    """
     result = await db.execute(select(Incident).where(Incident.id == incident_id))
     incident = result.scalar_one_or_none()
     if incident is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Triage agent not yet implemented (Slice 2)",
+
+    try:
+        triage_result = await run_triage_loop(db=db, incident=incident)
+    except TriageError as err:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(err))
+
+    # Persist triage run record
+    triage_run = TriageRun(
+        incident_id=incident.id,
+        proposal_json=triage_result.proposal.model_dump_json(),
+        steps_json=json.dumps([s.model_dump() for s in triage_result.steps]),
+        rule_check_json=triage_result.rule_check.model_dump_json(),
+        critic_json=triage_result.critic.model_dump_json(),
+    )
+    db.add(triage_run)
+
+    # Update incident severity, category, and status to Triaged
+    incident.severity = SeverityEnum(triage_result.proposal.severity)
+    incident.category = triage_result.proposal.category
+    incident.status = StatusEnum.Triaged
+
+    await db.commit()
+    await db.refresh(triage_run)
+
+    return TriageRunOut(
+        id=triage_run.id,
+        incident_id=triage_run.incident_id,
+        proposal_json=triage_run.proposal_json,
+        steps_json=triage_run.steps_json,
+        rule_check_json=triage_run.rule_check_json,
+        critic_json=triage_run.critic_json,
+        created_at=triage_run.created_at,
     )
 
 
@@ -129,12 +165,57 @@ async def record_decision(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Decision endpoint — implemented in Slice 2. Returns 501 in Slice 1."""
+    """
+    Record human decision (Approved/Rejected) and update incident status
+    in ONE atomic database transaction, rolling back both on any error.
+    """
     result = await db.execute(select(Incident).where(Incident.id == incident_id))
     incident = result.scalar_one_or_none()
     if incident is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Decision recording not yet implemented (Slice 2)",
+
+    # Get latest triage run for this incident
+    tr_res = await db.execute(
+        select(TriageRun)
+        .where(TriageRun.incident_id == incident.id)
+        .order_by(TriageRun.created_at.desc())
+        .limit(1)
+    )
+    latest_run = tr_res.scalar_one_or_none()
+    if latest_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot decide on an incident that has not been triaged",
+        )
+
+    # Atomic write: insert decision + update status in ONE transaction
+    try:
+        decision_rec = Decision(
+            triage_run_id=latest_run.id,
+            decision=body.decision,
+            note=body.note,
+            decided_by=current_user.id,
+        )
+        db.add(decision_rec)
+
+        # Update incident status
+        new_status = StatusEnum.Approved if body.decision == "Approved" else StatusEnum.Rejected
+        incident.status = new_status
+
+        await db.commit()
+        await db.refresh(decision_rec)
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database transaction failed and was rolled back: {e}",
+        )
+
+    return DecisionOut(
+        id=decision_rec.id,
+        triage_run_id=decision_rec.triage_run_id,
+        decision=decision_rec.decision,
+        note=decision_rec.note,
+        decided_by=decision_rec.decided_by,
+        decided_at=decision_rec.decided_at,
     )

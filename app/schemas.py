@@ -50,6 +50,7 @@ class IncidentOut(BaseModel):
     id: int
     title: str
     description: str
+    category: str | None = None
     severity: str | None
     status: str
     created_by: int
@@ -62,6 +63,7 @@ class IncidentListItem(BaseModel):
 
     id: int
     title: str
+    category: str | None = None
     severity: str | None
     status: str
     created_at: datetime
