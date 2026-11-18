@@ -10,7 +10,7 @@ POST /incidents/{id}/decision  — writes decision & updates status in ONE atomi
 import json
 from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.graph import run_langgraph_triage_loop
@@ -35,31 +35,45 @@ async def list_incidents(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Return all incidents with latest triage_run id."""
-    result = await db.execute(select(Incident).order_by(Incident.created_at.desc()))
-    incidents = result.scalars().all()
-
-    items = []
-    for inc in incidents:
-        tr_result = await db.execute(
-            select(TriageRun.id)
-            .where(TriageRun.incident_id == inc.id)
-            .order_by(TriageRun.created_at.desc())
-            .limit(1)
-        )
-        latest_tr_id = tr_result.scalar_one_or_none()
-        items.append(
-            IncidentListItem(
-                id=inc.id,
-                title=inc.title,
-                category=inc.category,
-                severity=inc.severity.value if inc.severity else None,
-                status=inc.status.value,
-                created_at=inc.created_at,
-                latest_triage_id=latest_tr_id,
+    """Return all incidents with latest triage_run id in ONE database JOIN query."""
+    latest_runs = (
+        select(
+            TriageRun.id.label("triage_run_id"),
+            TriageRun.incident_id,
+            func.row_number()
+            .over(
+                partition_by=TriageRun.incident_id,
+                order_by=TriageRun.created_at.desc(),
             )
+            .label("rn"),
         )
-    return items
+        .subquery()
+    )
+
+    stmt = (
+        select(Incident, latest_runs.c.triage_run_id)
+        .outerjoin(
+            latest_runs,
+            (latest_runs.c.incident_id == Incident.id) & (latest_runs.c.rn == 1),
+        )
+        .order_by(Incident.created_at.desc())
+    )
+
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    return [
+        IncidentListItem(
+            id=inc.id,
+            title=inc.title,
+            category=inc.category,
+            severity=inc.severity.value if inc.severity else None,
+            status=inc.status.value,
+            created_at=inc.created_at,
+            latest_triage_id=triage_run_id,
+        )
+        for inc, triage_run_id in rows
+    ]
 
 
 @router.post("", response_model=IncidentOut, status_code=status.HTTP_201_CREATED)

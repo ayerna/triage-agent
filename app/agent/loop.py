@@ -2,7 +2,7 @@
 Framework-free agent loop for Incident Triage.
 Executes the 7 steps:
 1. Plan
-2. Act (tools: search_past_incidents, get_incident)
+2. Act (tool calling: sends tool definitions, executes model tool calls or fallback)
 3. Draft (JSON structured proposal)
 4. Check (Pydantic validation, 1 retry on invalid JSON, fail on second)
 5. Rule check (deterministic safety rules)
@@ -22,7 +22,7 @@ from app.agent.schemas import (
     TriageProposal,
     TriageRunResult,
 )
-from app.agent.tools import get_incident, search_past_incidents
+from app.agent.tools import TOOL_DEFINITIONS, get_incident, search_past_incidents
 from app.config import settings
 from app.models import Incident
 
@@ -120,10 +120,12 @@ async def run_triage_loop(
     incident: Incident,
     decider_fn: Callable[..., Any] | None = None,
     critic_fn: Callable[..., Any] | None = None,
+    tool_caller_fn: Callable[..., Any] | None = None,
 ) -> TriageRunResult:
     """
     Execute the framework-free triage agent loop.
     Uses Groq model if GROQ_API_KEY is configured in .env and no override provided.
+    Supports real function calling with tool definitions.
     """
     if decider_fn is not None:
         decider = decider_fn
@@ -141,6 +143,14 @@ async def run_triage_loop(
     else:
         critic = stub_critic
 
+    if tool_caller_fn is not None:
+        tool_caller = tool_caller_fn
+    elif settings.GROQ_API_KEY:
+        from app.agent.client import groq_tool_caller
+        tool_caller = groq_tool_caller
+    else:
+        tool_caller = None
+
     steps: list[AgentStep] = []
 
     # 1. Plan
@@ -156,23 +166,79 @@ async def run_triage_loop(
         )
     )
 
-    # 2. Act
-    past_matches = await search_past_incidents(
-        db=db,
-        query=query_plan,
-        exclude_id=incident.id,
-        limit=3,
-    )
+    # 2. Act (Real Function Calling execution)
+    incident_data = {
+        "id": incident.id,
+        "title": incident.title,
+        "description": incident.description,
+    }
+
+    past_matches: list[dict] = []
     detailed_evidence: list[dict] = []
-    for match in past_matches[:2]:
-        detail = await get_incident(db, match["id"])
-        if detail:
-            detailed_evidence.append(detail)
+    tool_calls_executed: list[dict] = []
+
+    if tool_caller is not None:
+        try:
+            if inspect.iscoroutinefunction(tool_caller):
+                requested_calls = await tool_caller(incident_data, TOOL_DEFINITIONS)
+            else:
+                requested_calls = tool_caller(incident_data, TOOL_DEFINITIONS)
+        except Exception:
+            requested_calls = []
+
+        for call in requested_calls:
+            fn_name = call.get("name")
+            args = call.get("arguments", {})
+            if fn_name == "search_past_incidents":
+                q = args.get("query", query_plan)
+                limit = args.get("limit", 3)
+                matches = await search_past_incidents(db, query=q, exclude_id=incident.id, limit=limit)
+                past_matches.extend(matches)
+                tool_calls_executed.append({
+                    "tool": "search_past_incidents",
+                    "arguments": args,
+                    "matches_count": len(matches),
+                })
+                for m in matches[:2]:
+                    det = await get_incident(db, m["id"])
+                    if det and not any(e["id"] == det["id"] for e in detailed_evidence):
+                        detailed_evidence.append(det)
+
+            elif fn_name == "get_incident":
+                inc_id = args.get("incident_id")
+                if inc_id is not None:
+                    det = await get_incident(db, int(inc_id))
+                    if det and not any(e["id"] == det["id"] for e in detailed_evidence):
+                        detailed_evidence.append(det)
+                    tool_calls_executed.append({
+                        "tool": "get_incident",
+                        "arguments": args,
+                        "found": bool(det),
+                    })
+
+    # If tool caller produced no matches/calls (or running offline stub without tool_caller):
+    if not past_matches and not detailed_evidence:
+        past_matches = await search_past_incidents(
+            db=db,
+            query=query_plan,
+            exclude_id=incident.id,
+            limit=3,
+        )
+        for match in past_matches[:2]:
+            detail = await get_incident(db, match["id"])
+            if detail and not any(e["id"] == detail["id"] for e in detailed_evidence):
+                detailed_evidence.append(detail)
+        tool_calls_executed.append({
+            "tool": "search_past_incidents (fallback)",
+            "query": query_plan,
+            "matches_count": len(past_matches),
+        })
 
     steps.append(
         AgentStep(
             step="act",
             details={
+                "tool_calls": tool_calls_executed,
                 "matches_found": len(past_matches),
                 "inspected_matches": [m["id"] for m in detailed_evidence],
             },
@@ -180,12 +246,6 @@ async def run_triage_loop(
     )
 
     # 3. Draft & 4. Check (with 1 retry on invalid JSON)
-    incident_data = {
-        "id": incident.id,
-        "title": incident.title,
-        "description": incident.description,
-    }
-
     raw_proposal = await execute_decider(decider, incident_data, detailed_evidence, retry_error=None)
     steps.append(
         AgentStep(

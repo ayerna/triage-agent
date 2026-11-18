@@ -1,13 +1,18 @@
 """
-LangGraph implementation of the Incident Triage Agent loop.
+LangGraph state machine re-implementation of the Incident Triage agent loop.
 Nodes:
-- plan: decides what evidence is needed
-- tools: calls search_past_incidents and get_incident
-- draft: generates structured JSON proposal
-- check: validates with Pydantic; routes back to draft on first error, fails on second
-- rule_check: applies deterministic safety rules
-- critic: critic pass re-reading proposal against evidence
+- plan: determine search plan
+- tools: execute function calls / tools against PostgreSQL
+- draft: call decider (Groq or stub)
+- check: validate JSON with Pydantic; routes to retry edge on invalid output
+- rule_check: deterministic safety rules
+- critic: critique proposal against evidence
+- handle_failure: fail gracefully after 1 retry
+
+Both implementations (framework-free in loop.py and LangGraph here) live
+side-by-side in the repository so they can be directly compared.
 """
+import inspect
 from typing import Any, Callable, TypedDict
 from langgraph.graph import END, StateGraph
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,12 +26,12 @@ from app.agent.schemas import (
     TriageProposal,
     TriageRunResult,
 )
-from app.agent.tools import get_incident, search_past_incidents
+from app.agent.tools import TOOL_DEFINITIONS, get_incident, search_past_incidents
 from app.config import settings
 from app.models import Incident
 
 
-class TriageGraphState(TypedDict):
+class TriageGraphState(TypedDict, total=False):
     incident: dict
     plan_query: str
     detailed_evidence: list[dict]
@@ -45,6 +50,7 @@ def create_triage_graph(
     db: AsyncSession,
     decider_fn: Callable[..., Any] | None = None,
     critic_fn: Callable[..., Any] | None = None,
+    tool_caller_fn: Callable[..., Any] | None = None,
 ):
     """Build and compile the LangGraph StateGraph for triage."""
 
@@ -63,6 +69,14 @@ def create_triage_graph(
         critic = groq_critic
     else:
         critic = stub_critic
+
+    if tool_caller_fn is not None:
+        tool_caller = tool_caller_fn
+    elif settings.GROQ_API_KEY:
+        from app.agent.client import groq_tool_caller
+        tool_caller = groq_tool_caller
+    else:
+        tool_caller = None
 
     # ── Node 1: Plan ─────────────────────────────────────────────────────────
     async def plan_node(state: TriageGraphState) -> dict:
@@ -84,21 +98,71 @@ def create_triage_graph(
     # ── Node 2: Tools ────────────────────────────────────────────────────────
     async def tools_node(state: TriageGraphState) -> dict:
         inc = state["incident"]
-        past_matches = await search_past_incidents(
-            db=db,
-            query=state["plan_query"],
-            exclude_id=inc.get("id"),
-            limit=3,
-        )
+        query_plan = state.get("plan_query", "")
+        past_matches: list[dict] = []
         detailed_evidence: list[dict] = []
-        for match in past_matches[:2]:
-            detail = await get_incident(db, match["id"])
-            if detail:
-                detailed_evidence.append(detail)
+        tool_calls_executed: list[dict] = []
+
+        if tool_caller is not None:
+            try:
+                if inspect.iscoroutinefunction(tool_caller):
+                    requested_calls = await tool_caller(inc, TOOL_DEFINITIONS)
+                else:
+                    requested_calls = tool_caller(inc, TOOL_DEFINITIONS)
+            except Exception:
+                requested_calls = []
+
+            for call in requested_calls:
+                fn_name = call.get("name")
+                args = call.get("arguments", {})
+                if fn_name == "search_past_incidents":
+                    q = args.get("query", query_plan)
+                    limit = args.get("limit", 3)
+                    matches = await search_past_incidents(db, query=q, exclude_id=inc.get("id"), limit=limit)
+                    past_matches.extend(matches)
+                    tool_calls_executed.append({
+                        "tool": "search_past_incidents",
+                        "arguments": args,
+                        "matches_count": len(matches),
+                    })
+                    for m in matches[:2]:
+                        det = await get_incident(db, m["id"])
+                        if det and not any(e["id"] == det["id"] for e in detailed_evidence):
+                            detailed_evidence.append(det)
+
+                elif fn_name == "get_incident":
+                    inc_id = args.get("incident_id")
+                    if inc_id is not None:
+                        det = await get_incident(db, int(inc_id))
+                        if det and not any(e["id"] == det["id"] for e in detailed_evidence):
+                            detailed_evidence.append(det)
+                        tool_calls_executed.append({
+                            "tool": "get_incident",
+                            "arguments": args,
+                            "found": bool(det),
+                        })
+
+        if not past_matches and not detailed_evidence:
+            past_matches = await search_past_incidents(
+                db=db,
+                query=query_plan,
+                exclude_id=inc.get("id"),
+                limit=3,
+            )
+            for match in past_matches[:2]:
+                detail = await get_incident(db, match["id"])
+                if detail and not any(e["id"] == detail["id"] for e in detailed_evidence):
+                    detailed_evidence.append(detail)
+            tool_calls_executed.append({
+                "tool": "search_past_incidents (fallback)",
+                "query": query_plan,
+                "matches_count": len(past_matches),
+            })
 
         step = AgentStep(
             step="act",
             details={
+                "tool_calls": tool_calls_executed,
                 "matches_found": len(past_matches),
                 "inspected_matches": [m["id"] for m in detailed_evidence],
             },
@@ -141,90 +205,105 @@ def create_triage_graph(
                 "proposal": parsed.model_dump(),
                 "is_valid": True,
                 "is_failed": False,
-                "validation_error": None,
                 "steps": [*state.get("steps", []), step.model_dump()],
             }
-        except Exception as e:
-            if attempt >= 2:
+        except Exception as err:
+            if attempt == 1:
                 step = AgentStep(
                     step="check",
-                    details={"attempt": attempt, "status": "failed", "error": str(e)},
+                    details={"attempt": 1, "status": "invalid", "error": str(err)},
                 )
                 return {
+                    "validation_error": str(err),
                     "is_valid": False,
-                    "is_failed": True,
-                    "validation_error": str(e),
+                    "is_failed": False,
                     "steps": [*state.get("steps", []), step.model_dump()],
                 }
             else:
                 step = AgentStep(
                     step="check",
-                    details={"attempt": attempt, "status": "invalid", "error": str(e)},
+                    details={"attempt": 2, "status": "failed", "error": str(err)},
                 )
                 return {
+                    "validation_error": str(err),
                     "is_valid": False,
-                    "is_failed": False,
-                    "validation_error": str(e),
+                    "is_failed": True,
                     "steps": [*state.get("steps", []), step.model_dump()],
                 }
-
-    # ── Router function for Check conditional edge ───────────────────────────
-    def route_check(state: TriageGraphState) -> str:
-        if state["is_valid"]:
-            return "rule_check"
-        elif state["is_failed"]:
-            return "handle_failure"
-        return "draft"  # Retry edge
-
-    # ── Failure handler node ─────────────────────────────────────────────────
-    async def failure_node(state: TriageGraphState) -> dict:
-        raise TriageError(
-            f"Failed to generate valid triage proposal after 1 retry: {state.get('validation_error')}"
-        )
 
     # ── Node 5: Rule Check ───────────────────────────────────────────────────
     async def rule_check_node(state: TriageGraphState) -> dict:
         inc = state["incident"]
-        raw_prop = state["proposal"]
-        proposal_obj = TriageProposal.model_validate(raw_prop)
+        raw_p = state["proposal"]
+        p = TriageProposal(**raw_p) if raw_p else None
 
-        adjusted_prop, rule_res = deterministic_rule_check(
+        adjusted, rule_result = deterministic_rule_check(
             title=inc.get("title", ""),
             description=inc.get("description", ""),
-            proposal=proposal_obj,
+            proposal=p,
         )
-        step = AgentStep(step="rule_check", details=rule_res.model_dump())
+        step = AgentStep(
+            step="rule_check",
+            details=rule_result.model_dump(),
+        )
         return {
-            "proposal": adjusted_prop.model_dump(),
-            "rule_check": rule_res.model_dump(),
+            "proposal": adjusted.model_dump() if adjusted else None,
+            "rule_check": rule_result.model_dump(),
             "steps": [*state.get("steps", []), step.model_dump()],
         }
 
     # ── Node 6: Critic ───────────────────────────────────────────────────────
     async def critic_node(state: TriageGraphState) -> dict:
-        proposal_obj = TriageProposal.model_validate(state["proposal"])
-        critic_res = await execute_critic(
-            critic,
-            proposal_obj,
-            state.get("detailed_evidence", []),
+        raw_p = state["proposal"]
+        p = TriageProposal(**raw_p) if raw_p else None
+        evidence = state.get("detailed_evidence", [])
+
+        if p is not None:
+            critic_res = await execute_critic(critic, p, evidence)
+        else:
+            critic_res = CriticResult(verdict="ok", contradictions=[])
+
+        critic_step = AgentStep(
+            step="critic",
+            details=critic_res.model_dump(),
         )
-        step = AgentStep(step="critic", details=critic_res.model_dump())
-        stop_step = AgentStep(step="stop", details={"status": "completed", "ready_for_human_review": True})
+        stop_step = AgentStep(
+            step="stop",
+            details={"status": "completed", "ready_for_human_review": True},
+        )
         return {
             "critic": critic_res.model_dump(),
-            "steps": [*state.get("steps", []), step.model_dump(), stop_step.model_dump()],
+            "steps": [
+                *state.get("steps", []),
+                critic_step.model_dump(),
+                stop_step.model_dump(),
+            ],
         }
 
-    # ── Construct the StateGraph ─────────────────────────────────────────────
+    # ── Node 7: Handle Failure ───────────────────────────────────────────────
+    async def handle_failure_node(state: TriageGraphState) -> dict:
+        err = state.get("validation_error", "Unknown validation error")
+        raise TriageError(f"Failed to generate valid triage proposal after 1 retry: {err}")
+
+    # ── Conditional Routing Function ─────────────────────────────────────────
+    def route_check(state: TriageGraphState) -> str:
+        if state.get("is_valid"):
+            return "rule_check"
+        elif state.get("is_failed"):
+            return "handle_failure"
+        else:
+            return "draft"
+
+    # ── Build StateGraph ─────────────────────────────────────────────────────
     workflow = StateGraph(TriageGraphState)
 
     workflow.add_node("plan", plan_node)
     workflow.add_node("tools", tools_node)
     workflow.add_node("draft", draft_node)
     workflow.add_node("check", check_node)
-    workflow.add_node("handle_failure", failure_node)
     workflow.add_node("rule_check", rule_check_node)
     workflow.add_node("critic", critic_node)
+    workflow.add_node("handle_failure", handle_failure_node)
 
     workflow.set_entry_point("plan")
     workflow.add_edge("plan", "tools")
@@ -252,9 +331,15 @@ async def run_langgraph_triage_loop(
     incident: Incident,
     decider_fn: Callable[..., Any] | None = None,
     critic_fn: Callable[..., Any] | None = None,
+    tool_caller_fn: Callable[..., Any] | None = None,
 ) -> TriageRunResult:
     """Execute triage using the LangGraph state machine graph."""
-    app_graph = create_triage_graph(db=db, decider_fn=decider_fn, critic_fn=critic_fn)
+    app_graph = create_triage_graph(
+        db=db,
+        decider_fn=decider_fn,
+        critic_fn=critic_fn,
+        tool_caller_fn=tool_caller_fn,
+    )
 
     initial_state: TriageGraphState = {
         "incident": {
@@ -277,14 +362,13 @@ async def run_langgraph_triage_loop(
 
     final_state = await app_graph.ainvoke(initial_state)
 
-    proposal = TriageProposal.model_validate(final_state["proposal"])
-    rule_check = RuleCheckResult.model_validate(final_state["rule_check"])
-    critic = CriticResult.model_validate(final_state["critic"])
-    steps = [AgentStep.model_validate(s) for s in final_state["steps"]]
+    proposal_data = final_state.get("proposal")
+    if not proposal_data:
+        raise TriageError("LangGraph loop ended without valid proposal")
 
     return TriageRunResult(
-        proposal=proposal,
-        steps=steps,
-        rule_check=rule_check,
-        critic=critic,
+        proposal=TriageProposal(**proposal_data),
+        steps=[AgentStep(**s) for s in final_state.get("steps", [])],
+        rule_check=RuleCheckResult(**(final_state.get("rule_check") or {"status": "clean"})),
+        critic=CriticResult(**(final_state.get("critic") or {"verdict": "ok", "contradictions": []})),
     )

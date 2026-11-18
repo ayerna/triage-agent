@@ -1,22 +1,30 @@
 """
 Slice 3 tests:
 - Groq client and cleaner functions
+- Real function calling: tool definitions in Groq payload, parsing, execution in loop
 - LangGraph implementation of the triage loop
 - LangGraph retry edge handling (attempt 1 invalid -> attempt 2 valid)
 - LangGraph retry failure edge (attempt 1 & 2 invalid -> TriageError)
 - API endpoint support for both engine='framework_free' and engine='langgraph'
 - Optional live Groq API call (skipped if GROQ_API_KEY is unset)
+- Real JOIN verification on GET /incidents
 """
 import json
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from app.agent.client import clean_json_text, groq_critic, groq_decider
+from app.agent.client import (
+    clean_json_text,
+    groq_critic,
+    groq_decider,
+    groq_tool_caller,
+)
 from app.agent.graph import run_langgraph_triage_loop
 from app.agent.loop import TriageError, run_triage_loop
 from app.agent.schemas import CriticResult, TriageProposal
+from app.agent.tools import TOOL_DEFINITIONS
 from app.config import settings
-from app.models import Incident, StatusEnum
+from app.models import Incident, SeverityEnum, StatusEnum, TriageRun
 
 
 # ── 1. Client Unit Tests ─────────────────────────────────────────────────────
@@ -85,7 +93,107 @@ async def test_groq_critic_parsing():
         assert critic_res.contradictions == []
 
 
-# ── 2. LangGraph Loop Tests ──────────────────────────────────────────────────
+# ── 2. Real Function Calling Tests ───────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_groq_tool_caller_payload_and_parsing():
+    """
+    Verify that groq_tool_caller sends the two tool definitions in the Groq payload,
+    and cleanly parses returned tool calls from the model.
+    """
+    mock_message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_search_01",
+                "type": "function",
+                "function": {
+                    "name": "search_past_incidents",
+                    "arguments": json.dumps({"query": "cooling pump leak", "limit": 2}),
+                },
+            }
+        ],
+    }
+
+    with patch("app.agent.client.call_groq_completion", new_callable=AsyncMock) as mock_completion:
+        mock_completion.return_value = mock_message
+
+        incident = {
+            "id": 10,
+            "title": "Main SW Cooling Pump Leak",
+            "description": "Shaft gland dripping 20 drops per minute",
+        }
+
+        parsed_calls = await groq_tool_caller(incident, TOOL_DEFINITIONS)
+
+        assert mock_completion.called
+        _, kwargs = mock_completion.call_args
+        # Verify tool definitions were sent in the payload
+        assert kwargs["tools"] == TOOL_DEFINITIONS
+        assert len(kwargs["tools"]) == 2
+        tool_names = [t["function"]["name"] for t in kwargs["tools"]]
+        assert "search_past_incidents" in tool_names
+        assert "get_incident" in tool_names
+
+        # Verify returned parsed tool calls
+        assert len(parsed_calls) == 1
+        assert parsed_calls[0]["name"] == "search_past_incidents"
+        assert parsed_calls[0]["arguments"] == {"query": "cooling pump leak", "limit": 2}
+
+
+@pytest.mark.asyncio
+async def test_loop_executes_mocked_tool_call(db_session, test_user):
+    """
+    Verify that the loop executes the tool call returned by the model,
+    queries PostgreSQL, records the tool call details in the 'act' step,
+    and feeds the evidence into the proposal drafting.
+    """
+    # 1. Seed past precedent incident
+    past_inc = Incident(
+        title="Main SW Cooling Pump Gland Leak",
+        description="Past incident with pump gland packing replacement",
+        category="Hardware",
+        severity=SeverityEnum.High,
+        status=StatusEnum.Approved,
+        created_by=test_user.id,
+    )
+    # 2. Target incident being triaged
+    target_inc = Incident(
+        title="Emergency SW Cooling Pump Failure",
+        description="Cooling pump shaft gland leaking seawater",
+        created_by=test_user.id,
+    )
+    db_session.add_all([past_inc, target_inc])
+    await db_session.commit()
+
+    # Mock tool caller returning a tool call for search_past_incidents
+    async def mock_tool_caller(incident_dict, tools):
+        return [
+            {
+                "id": "call_123",
+                "name": "search_past_incidents",
+                "arguments": {"query": "Cooling Pump", "limit": 2},
+            }
+        ]
+
+    # Run the loop with our mock tool caller
+    result = await run_triage_loop(db_session, target_inc, tool_caller_fn=mock_tool_caller)
+
+    # Verify 'act' step recorded real tool call execution
+    act_step = [s for s in result.steps if s.step == "act"][0]
+    executed = act_step.details.get("tool_calls", [])
+    assert len(executed) >= 1
+    assert executed[0]["tool"] == "search_past_incidents"
+    assert executed[0]["arguments"] == {"query": "Cooling Pump", "limit": 2}
+    assert executed[0]["matches_count"] >= 1
+
+    # Verify inspected matches contain our seeded precedent
+    assert past_inc.id in act_step.details["inspected_matches"]
+    assert result.proposal.category == "Hardware"
+
+
+# ── 3. LangGraph Loop Tests ──────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_langgraph_loop_runs_and_produces_valid_result(db_session, test_user):
@@ -193,7 +301,7 @@ async def test_langgraph_deterministic_rules_escalation(db_session, test_user):
     assert "fire" in res.rule_check.rule_reason.lower()
 
 
-# ── 3. API Route with Engine Selection ───────────────────────────────────────
+# ── 4. API Route with Engine Selection ───────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_api_triage_with_langgraph_engine(client, auth_headers):
@@ -219,7 +327,53 @@ async def test_api_triage_with_langgraph_engine(client, auth_headers):
     assert inc_resp.json()["status"] == "Triaged"
 
 
-# ── 4. Optional Live Groq API Test ───────────────────────────────────────────
+# ── 5. Real JOIN Query Verification ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_incidents_real_join_with_latest_triage_id(client, auth_headers):
+    """
+    Verify GET /incidents uses the single JOIN query to fetch both incidents
+    and correctly attach the latest triage_run id.
+    """
+    # 1. Create incident A (triaged)
+    resp_a = await client.post(
+        "/incidents",
+        json={"title": "Main Engine Turbocharger Surge", "description": "Surging at 85% MCR"},
+        headers=auth_headers,
+    )
+    id_a = resp_a.json()["id"]
+
+    # 2. Create incident B (untriaged)
+    resp_b = await client.post(
+        "/incidents",
+        json={"title": "Galley Refrigerator Compressor Trip", "description": "Thermal overload trip"},
+        headers=auth_headers,
+    )
+    id_b = resp_b.json()["id"]
+
+    # 3. Triage incident A
+    triage_resp = await client.post(f"/incidents/{id_a}/triage", headers=auth_headers)
+    assert triage_resp.status_code == 201
+    triage_id_a = triage_resp.json()["id"]
+
+    # 4. Fetch list via GET /incidents (executed with single outerjoin query)
+    list_resp = await client.get("/incidents", headers=auth_headers)
+    assert list_resp.status_code == 200
+    items = list_resp.json()
+
+    item_a = next(i for i in items if i["id"] == id_a)
+    item_b = next(i for i in items if i["id"] == id_b)
+
+    # Incident A must have latest_triage_id populated
+    assert item_a["latest_triage_id"] == triage_id_a
+    assert item_a["status"] == "Triaged"
+
+    # Incident B must have latest_triage_id as None
+    assert item_b["latest_triage_id"] is None
+    assert item_b["status"] == "Open"
+
+
+# ── 6. Optional Live Groq API Test ───────────────────────────────────────────
 
 @pytest.mark.skipif(not settings.GROQ_API_KEY, reason="GROQ_API_KEY not configured in .env")
 @pytest.mark.asyncio
