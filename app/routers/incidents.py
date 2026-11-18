@@ -4,14 +4,16 @@ Incident CRUD and Agent endpoints — all protected by JWT.
 GET  /incidents                — list with latest triage status (JOIN across tables)
 POST /incidents                — create; 400 on blank title/description
 GET  /incidents/{id}           — detail; 404 if missing
-POST /incidents/{id}/triage    — runs agent loop, records TriageRun, updates status
+POST /incidents/{id}/triage    — runs agent loop (framework-free or langgraph)
 POST /incidents/{id}/decision  — writes decision & updates status in ONE atomic transaction
 """
 import json
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Literal
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.graph import run_langgraph_triage_loop
 from app.agent.loop import TriageError, run_triage_loop
 from app.auth import get_current_user
 from app.database import get_db
@@ -111,11 +113,16 @@ async def get_incident(
 @router.post("/{incident_id}/triage", response_model=TriageRunOut, status_code=status.HTTP_201_CREATED)
 async def triage_incident(
     incident_id: int,
+    engine: Literal["framework_free", "langgraph"] = Query(
+        "framework_free",
+        description="Choose triage execution engine: framework_free or langgraph",
+    ),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
     Run the triage agent loop for this incident.
+    Supports engine='framework_free' (default) or engine='langgraph'.
     Persists TriageRun with proposal, steps, rule checks, critic output.
     Updates incident status to Triaged.
     """
@@ -125,7 +132,10 @@ async def triage_incident(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
 
     try:
-        triage_result = await run_triage_loop(db=db, incident=incident)
+        if engine == "langgraph":
+            triage_result = await run_langgraph_triage_loop(db=db, incident=incident)
+        else:
+            triage_result = await run_triage_loop(db=db, incident=incident)
     except TriageError as err:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(err))
 

@@ -9,6 +9,7 @@ Executes the 7 steps:
 6. Critic pass (verification against evidence)
 7. Stop (return structured triage run result, no auto-approval)
 """
+import inspect
 import json
 from typing import Any, Callable
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,7 @@ from app.agent.schemas import (
     TriageRunResult,
 )
 from app.agent.tools import get_incident, search_past_incidents
+from app.config import settings
 from app.models import Incident
 
 
@@ -30,7 +32,7 @@ class TriageError(Exception):
     pass
 
 
-# ── Stub Decider for Slice 2 ─────────────────────────────────────────────────
+# ── Stub Decider / Critic (used when GROQ_API_KEY is not set or in offline tests) ─
 
 def stub_decider(
     incident: dict,
@@ -38,14 +40,12 @@ def stub_decider(
     retry_error: str | None = None,
 ) -> str:
     """
-    Slice 2 stub decider: returns a valid JSON string without external API calls.
-    Can use past precedent if available.
+    Offline/stub decider: returns a valid JSON string without external API calls.
     """
     title = incident.get("title", "")
     desc = incident.get("description", "")
     full_text = f"{title} {desc}".lower()
 
-    # Simple heuristic to determine stub category
     if any(k in full_text for k in ["leak", "engine", "valve", "bearing", "pump", "fan"]):
         category = "Hardware"
     elif any(k in full_text for k in ["switch", "network", "cctv", "ais", "gmdss"]):
@@ -57,7 +57,6 @@ def stub_decider(
     else:
         category = "Other"
 
-    # Default severity from precedent or text
     if any(k in full_text for k in ["fire", "flooding", "safety", "high", "drop"]):
         severity = "High"
     elif any(k in full_text for k in ["leak", "alarm", "fault"]):
@@ -65,7 +64,6 @@ def stub_decider(
     else:
         severity = "Low"
 
-    # Check if a precedent was found
     summary = f"Identified issue affecting {category.lower()} equipment."
     action = "Inspect affected component, isolate if necessary, and schedule repair."
     if past_evidence:
@@ -84,13 +82,35 @@ def stub_decider(
 
 
 def stub_critic(proposal: TriageProposal, past_evidence: list[dict]) -> CriticResult:
-    """Slice 2 stub critic: checks proposal against evidence."""
+    """Offline stub critic: checks proposal against evidence."""
     contradictions = []
-    # If confidence is exceptionally low or action empty
     if not proposal.recommended_action:
         contradictions.append("No recommended action provided.")
     verdict = "flagged" if contradictions else "ok"
     return CriticResult(verdict=verdict, contradictions=contradictions)
+
+
+async def execute_decider(
+    decider: Callable,
+    incident_data: dict,
+    detailed_evidence: list[dict],
+    retry_error: str | None = None,
+) -> str:
+    """Invoke decider function whether it is synchronous or async."""
+    if inspect.iscoroutinefunction(decider):
+        return await decider(incident_data, detailed_evidence, retry_error=retry_error)
+    return decider(incident_data, detailed_evidence, retry_error=retry_error)
+
+
+async def execute_critic(
+    critic: Callable,
+    proposal: TriageProposal,
+    detailed_evidence: list[dict],
+) -> CriticResult:
+    """Invoke critic function whether it is synchronous or async."""
+    if inspect.iscoroutinefunction(critic):
+        return await critic(proposal, detailed_evidence)
+    return critic(proposal, detailed_evidence)
 
 
 # ── Agent Loop ───────────────────────────────────────────────────────────────
@@ -98,14 +118,29 @@ def stub_critic(proposal: TriageProposal, past_evidence: list[dict]) -> CriticRe
 async def run_triage_loop(
     db: AsyncSession,
     incident: Incident,
-    decider_fn: Callable[..., str] | None = None,
-    critic_fn: Callable[..., CriticResult] | None = None,
+    decider_fn: Callable[..., Any] | None = None,
+    critic_fn: Callable[..., Any] | None = None,
 ) -> TriageRunResult:
     """
     Execute the framework-free triage agent loop.
+    Uses Groq model if GROQ_API_KEY is configured in .env and no override provided.
     """
-    decider = decider_fn or stub_decider
-    critic = critic_fn or stub_critic
+    if decider_fn is not None:
+        decider = decider_fn
+    elif settings.GROQ_API_KEY:
+        from app.agent.client import groq_decider
+        decider = groq_decider
+    else:
+        decider = stub_decider
+
+    if critic_fn is not None:
+        critic = critic_fn
+    elif settings.GROQ_API_KEY:
+        from app.agent.client import groq_critic
+        critic = groq_critic
+    else:
+        critic = stub_critic
+
     steps: list[AgentStep] = []
 
     # 1. Plan
@@ -151,7 +186,7 @@ async def run_triage_loop(
         "description": incident.description,
     }
 
-    raw_proposal = decider(incident_data, detailed_evidence, retry_error=None)
+    raw_proposal = await execute_decider(decider, incident_data, detailed_evidence, retry_error=None)
     steps.append(
         AgentStep(
             step="draft",
@@ -176,7 +211,7 @@ async def run_triage_loop(
             )
         )
         # Retry once
-        retry_raw = decider(incident_data, detailed_evidence, retry_error=str(first_err))
+        retry_raw = await execute_decider(decider, incident_data, detailed_evidence, retry_error=str(first_err))
         steps.append(
             AgentStep(
                 step="draft",
@@ -214,7 +249,7 @@ async def run_triage_loop(
     )
 
     # 6. Critic pass
-    critic_result = critic(adjusted_proposal, detailed_evidence)
+    critic_result = await execute_critic(critic, adjusted_proposal, detailed_evidence)
     steps.append(
         AgentStep(
             step="critic",
