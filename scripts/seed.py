@@ -22,8 +22,8 @@ from app.models import Incident, SeverityEnum, StatusEnum, User
 # SYNTHETIC SEED DATA — not real, not Renault, written for this learning project
 # ---------------------------------------------------------------------------
 SEED_USERS = [
-    {"email": "engineer@vessel-demo.local", "password": "demo-pass-1"},
-    {"email": "supervisor@vessel-demo.local", "password": "demo-pass-2"},
+    {"email": "engineer@vessel-demo.example.com", "password": "demo-pass-1"},
+    {"email": "supervisor@vessel-demo.example.com", "password": "demo-pass-2"},
 ]
 
 SEED_INCIDENTS = [
@@ -190,14 +190,21 @@ async def seed():
     async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with async_session() as session:
-        # Create users
+        # Check and create users idempotently
         created_users = []
         for u in SEED_USERS:
-            user = User(email=u["email"], hashed_password=hash_password(u["password"]))
-            session.add(user)
+            from sqlalchemy import select
+            res = await session.execute(select(User).where(User.email == u["email"]))
+            user = res.scalar_one_or_none()
+            if not user:
+                user = User(email=u["email"], hashed_password=hash_password(u["password"]))
+                session.add(user)
+                await session.flush()
             created_users.append(user)
 
-        await session.flush()  # get user IDs before inserting incidents
+        # Clear existing incidents to avoid duplicates on re-seed
+        from sqlalchemy import delete
+        await session.execute(delete(Incident))
 
         # Create incidents (all owned by first user)
         for inc_data in SEED_INCIDENTS:
@@ -211,7 +218,7 @@ async def seed():
             session.add(inc)
 
         await session.commit()
-        print(f"✅ Seeded {len(SEED_USERS)} users and {len(SEED_INCIDENTS)} synthetic incidents.")
+        print(f"[OK] Seeded {len(SEED_USERS)} users and {len(SEED_INCIDENTS)} synthetic incidents.")
 
     await engine.dispose()
 
